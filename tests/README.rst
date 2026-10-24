@@ -76,7 +76,18 @@ are asserted separately with exact outcomes:
 * Format checks ignore invalid default latency, since PortAudio does not use
   latency for format checking; the baseline raised TypeError.
 
-Together with the 53 direct-ALSA tests, the suite passes 127 cases on Linux ARM64
+Together with the 58 direct-ALSA tests, the suite passes 132 cases on Linux ARM64
 with CPython 3.14.7 and PortAudio 19.6.0. This comparison does not establish
 Windows/ASIO/WASAPI or macOS/CoreAudio compatibility, nor physical hardware
 behavior. Both revisions use ALSA null/file PCMs.
+
+Device-information errors
+-------------------------
+
+At feature revision ``a942c46``, a failed parameter lookup reports all unresolved
+values (channels, samplerate and/or numeric latency) in a ValueError, chaining
+the original PortAudioError as its cause. The suite checks input and output,
+individual and combined missing values, format checks without latency,
+recovery, and propagation of unrelated exceptions without wrapping.
+The 74-call baseline comparison still passes with the same two documented
+behavior differences; the complete suite passes 132 cases.

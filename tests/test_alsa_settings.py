@@ -289,9 +289,13 @@ def test_device_information_failures_propagate(direction, key, value, monkeypatc
     cls = sd.RawInputStream if direction == 'input' else sd.RawOutputStream
     with monkeypatch.context() as patch:
         patch.setattr(sd, 'query_devices', unavailable)
-        with pytest.raises(sd.PortAudioError) as caught:
+        with pytest.raises(ValueError) as caught:
             cls(**options)
-        assert caught.value is failure
+        required = 'numeric latency' if key == 'latency' else key
+        assert str(caught.value) == (
+            'Cannot determine {} stream parameters from device information; '
+            'specify {} explicitly or through defaults'.format(direction, required))
+        assert caught.value.__cause__ is failure
     with cls(**params(device=index, extra_settings=None)) as stream:
         assert stream.device == index
 
@@ -366,7 +370,49 @@ def test_direct_stream_accepts_settings_protocol(direction, monkeypatch):
 def test_direct_symbolic_latency_fails_and_numeric_recovers(direction, latency):
     """Direct streams cannot derive symbolic latency from unavailable devices."""
     cls = sd.RawInputStream if direction == 'input' else sd.RawOutputStream
-    with pytest.raises(sd.PortAudioError, match='Error querying device -2'):
+    with pytest.raises(ValueError, match='specify numeric latency') as caught:
         cls(**params(latency=latency))
+    assert isinstance(caught.value.__cause__, sd.PortAudioError)
+    assert str(caught.value.__cause__) == 'Error querying device -2'
     with cls(**params()) as stream:
         assert stream.device == -2
+
+
+@pytest.mark.parametrize('direction', ['input', 'output'])
+def test_missing_parameters_report_all_requirements(direction):
+    """Report all unresolved values and retain the underlying device error."""
+    cls = sd.RawInputStream if direction == 'input' else sd.RawOutputStream
+    with pytest.raises(ValueError) as caught:
+        cls(device=sd.DEVICE_FROM_EXTRA_SETTINGS,
+            extra_settings=sd.AlsaSettings('null'))
+    assert str(caught.value) == (
+        'Cannot determine {} stream parameters from device information; '
+        'specify channels, samplerate, numeric latency explicitly or through '
+        'defaults'.format(direction))
+    assert isinstance(caught.value.__cause__, sd.PortAudioError)
+
+
+@pytest.mark.parametrize('direction', ['input', 'output'])
+def test_format_check_error_does_not_request_latency(direction):
+    """Format checks request missing channel/rate values but never latency."""
+    with pytest.raises(ValueError) as caught:
+        getattr(sd, 'check_' + direction + '_settings')(
+            device=sd.DEVICE_FROM_EXTRA_SETTINGS,
+            extra_settings=sd.AlsaSettings('null'))
+    assert str(caught.value) == (
+        'Cannot determine {} stream parameters from device information; '
+        'specify channels, samplerate explicitly or through defaults'.format(direction))
+    assert isinstance(caught.value.__cause__, sd.PortAudioError)
+
+
+def test_unexpected_query_error_is_not_wrapped(monkeypatch):
+    """Do not disguise programming errors as missing stream parameters."""
+    failure = RuntimeError('unexpected query failure')
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(sd, 'query_devices', fail)
+    with pytest.raises(RuntimeError) as caught:
+        sd.RawInputStream(**params(latency='high'))
+    assert caught.value is failure
