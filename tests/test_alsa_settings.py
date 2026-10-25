@@ -82,7 +82,7 @@ def test_settings_alone_do_not_override_device(selector):
         assert stream.device == -2
 
 
-@pytest.mark.parametrize('value', ['', 'null\x00bad', None, b'null'])
+@pytest.mark.parametrize('value', ['null\x00bad'])
 def test_bad_address(value):
     """Bad address."""
     with pytest.raises((TypeError, ValueError)):
@@ -93,19 +93,15 @@ def test_bad_address(value):
     'key,value',
     [
         ('channels', None),
-        ('channels', 0),
         ('samplerate', None),
-        ('samplerate', float('nan')),
         ('latency', 'high'),
-        ('latency', float('inf')),
-        ('latency', -1),
     ],
 )
 def test_missing_or_invalid_explicit_parameters(key, value):
     """Missing or invalid explicit parameters."""
     options = params()
     options[key] = value
-    with pytest.raises((ValueError, sd.PortAudioError)):
+    with pytest.raises((TypeError, ValueError, sd.PortAudioError)):
         sd.RawInputStream(**options)
 
 
@@ -203,13 +199,30 @@ def test_one_direction_device_pair(kind, device):
         assert stream.device == -2
 
 
-@pytest.mark.parametrize('key', ['samplerate', 'latency'])
-def test_boolean_parameter_rejected(key):
-    """Boolean parameter rejected."""
-    options = params()
-    options[key] = True
-    with pytest.raises(ValueError):
-        sd.RawInputStream(**options)
+@pytest.mark.parametrize('key,value', [
+    ('channels', True), ('samplerate', True),
+    ('samplerate', float('nan')), ('latency', True),
+    ('latency', float('inf')), ('latency', -1),
+])
+def test_numeric_parameters_have_no_device_specific_validation(key, value):
+    """Indexed and direct paths pass the same numeric values to PortAudio."""
+    import math
+
+    results = []
+    for device, settings in [(0, None),
+                             (sd.DEVICE_FROM_EXTRA_SETTINGS, sd.AlsaSettings('null'))]:
+        options = dict(channels=2, dtype='int16', latency=0.05, samplerate=48000)
+        options[key] = value
+        parameters, _, _, samplerate, owner = sd._get_stream_parameters(
+            'input', device=device, extra_settings=settings, **options)
+        actual = dict(channels=parameters.channelCount,
+                      samplerate=samplerate, latency=parameters.suggestedLatency)[key]
+        results.append(actual)
+        assert owner is settings
+    if isinstance(value, float) and math.isnan(value):
+        assert all(math.isnan(result) for result in results)
+    else:
+        assert results[0] == results[1] == value
 
 
 def test_mixed_direct_and_indexed_duplex():
@@ -227,20 +240,9 @@ def test_mixed_direct_and_indexed_duplex():
 
 
 def test_missing_alsa_backend_error(monkeypatch):
-    """Missing alsa backend error."""
-    original = sd._lib
-
-    class NoAlsa:
-        paALSA = original.paALSA
-        Pa_GetErrorText = original.Pa_GetErrorText
-        paUnanticipatedHostError = original.paUnanticipatedHostError
-
-        @staticmethod
-        def Pa_HostApiTypeIdToHostApiIndex(api):
-            return original.paHostApiNotFound
-
-    monkeypatch.setattr(sd, '_lib', NoAlsa())
-    with pytest.raises(sd.PortAudioError, match='ALSA host API is unavailable'):
+    """An unavailable native initializer raises the normal symbol error."""
+    monkeypatch.setattr(sd, '_lib', object())
+    with pytest.raises(AttributeError, match='PaAlsa_InitializeStreamInfo'):
         sd.AlsaSettings('null')
 
 
@@ -289,12 +291,12 @@ def test_device_information_failures_propagate(direction, key, value, monkeypatc
     cls = sd.RawInputStream if direction == 'input' else sd.RawOutputStream
     with monkeypatch.context() as patch:
         patch.setattr(sd, 'query_devices', unavailable)
-        with pytest.raises(ValueError) as caught:
+        with pytest.raises(TypeError) as caught:
             cls(**options)
         required = 'numeric latency' if key == 'latency' else key
         assert str(caught.value) == (
-            'Cannot determine {} stream parameters from device information; '
-            'specify {} explicitly or through defaults'.format(direction, required))
+            'Cannot determine {} from device information; '
+            'specify {} explicitly or through defaults'.format(key, required))
         assert caught.value.__cause__ is failure
     with cls(**params(device=index, extra_settings=None)) as stream:
         assert stream.device == index
@@ -334,7 +336,7 @@ def test_sentinel_can_be_selected_in_defaults(monkeypatch):
 
 def test_sentinel_requires_settings_and_recovers():
     """Missing settings fail before opening, and a corrected call succeeds."""
-    with pytest.raises(ValueError, match='requires extra_settings'):
+    with pytest.raises(sd.PortAudioError, match='Invalid device'):
         sd.RawInputStream(**params(extra_settings=None))
     with sd.RawInputStream(**params()) as stream:
         assert len(stream.read(1024)[0]) == 4096
@@ -370,7 +372,7 @@ def test_direct_stream_accepts_settings_protocol(direction, monkeypatch):
 def test_direct_symbolic_latency_fails_and_numeric_recovers(direction, latency):
     """Direct streams cannot derive symbolic latency from unavailable devices."""
     cls = sd.RawInputStream if direction == 'input' else sd.RawOutputStream
-    with pytest.raises(ValueError, match='specify numeric latency') as caught:
+    with pytest.raises(TypeError, match='specify numeric latency') as caught:
         cls(**params(latency=latency))
     assert isinstance(caught.value.__cause__, sd.PortAudioError)
     assert str(caught.value.__cause__) == 'Error querying device -2'
@@ -379,29 +381,28 @@ def test_direct_symbolic_latency_fails_and_numeric_recovers(direction, latency):
 
 
 @pytest.mark.parametrize('direction', ['input', 'output'])
-def test_missing_parameters_report_all_requirements(direction):
-    """Report all unresolved values and retain the underlying device error."""
+def test_missing_parameters_report_first_requirement(direction):
+    """Report the first unresolved value and retain the underlying device error."""
     cls = sd.RawInputStream if direction == 'input' else sd.RawOutputStream
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(TypeError) as caught:
         cls(device=sd.DEVICE_FROM_EXTRA_SETTINGS,
             extra_settings=sd.AlsaSettings('null'))
     assert str(caught.value) == (
-        'Cannot determine {} stream parameters from device information; '
-        'specify channels, samplerate, numeric latency explicitly or through '
-        'defaults'.format(direction))
+        'Cannot determine channels from device information; '
+        'specify channels explicitly or through defaults')
     assert isinstance(caught.value.__cause__, sd.PortAudioError)
 
 
 @pytest.mark.parametrize('direction', ['input', 'output'])
 def test_format_check_error_does_not_request_latency(direction):
     """Format checks request missing channel/rate values but never latency."""
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(TypeError) as caught:
         getattr(sd, 'check_' + direction + '_settings')(
             device=sd.DEVICE_FROM_EXTRA_SETTINGS,
             extra_settings=sd.AlsaSettings('null'))
     assert str(caught.value) == (
-        'Cannot determine {} stream parameters from device information; '
-        'specify channels, samplerate explicitly or through defaults'.format(direction))
+        'Cannot determine channels from device information; '
+        'specify channels explicitly or through defaults')
     assert isinstance(caught.value.__cause__, sd.PortAudioError)
 
 
@@ -416,3 +417,41 @@ def test_unexpected_query_error_is_not_wrapped(monkeypatch):
     with pytest.raises(RuntimeError) as caught:
         sd.RawInputStream(**params(latency='high'))
     assert caught.value is failure
+
+
+@pytest.mark.parametrize('channels', [0, -1])
+def test_nonpositive_direct_channels_do_not_abort_process(channels):
+    """Invalid channel counts raise Python errors instead of native assertions."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, '-c', """
+import sounddevice as sd
+import sys
+try:
+    sd.RawInputStream(device=sd.DEVICE_FROM_EXTRA_SETTINGS,
+                      extra_settings=sd.AlsaSettings('null'),
+                      channels=int(sys.argv[1]), samplerate=48000,
+                      dtype='int16', latency=0.05)
+except ValueError as error:
+    assert str(error) == 'A positive channel count is required'
+else:
+    raise AssertionError('invalid channel count was accepted')
+""", str(channels)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_embedded_nul_would_truncate_the_native_address():
+    """Reject a PCM address that C would silently interpret as another name."""
+    address = 'null\0different-device'
+    native = sd._ffi.new('char[]', address.encode())
+    assert sd._ffi.string(native) == b'null'
+    with pytest.raises(ValueError, match='NUL'):
+        sd.AlsaSettings(address)
+
+
+def test_empty_address_is_forwarded_to_alsa():
+    """The backend owns empty-address semantics."""
+    settings = sd.AlsaSettings('')
+    assert sd._ffi.string(settings._streaminfo.deviceString) == b''

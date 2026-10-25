@@ -76,18 +76,25 @@ are asserted separately with exact outcomes:
 * Format checks ignore invalid default latency, since PortAudio does not use
   latency for format checking; the baseline raised TypeError.
 
-Together with the 58 direct-ALSA tests, the suite passes 132 cases on Linux ARM64
-with CPython 3.14.7 and PortAudio 19.6.0. This comparison does not establish
-Windows/ASIO/WASAPI or macOS/CoreAudio compatibility, nor physical hardware
-behavior. Both revisions use ALSA null/file PCMs.
+This comparison does not establish Windows/ASIO/WASAPI or macOS/CoreAudio
+compatibility, nor physical hardware behavior. Both revisions use ALSA
+null/file PCMs.
 
 Device-information errors
 -------------------------
 
-At feature revision ``a942c46``, a failed parameter lookup reports all unresolved
-values (channels, samplerate and/or numeric latency) in a ValueError, chaining
-the original PortAudioError as its cause. The suite checks input and output,
-individual and combined missing values, format checks without latency,
+A failed parameter lookup reports the first unresolved value in a TypeError,
+chaining the original PortAudioError as its cause. The suite checks input and
+output, individual and combined missing values, format checks without latency,
 recovery, and propagation of unrelated exceptions without wrapping.
-The 74-call baseline comparison still passes with the same two documented
-behavior differences; the complete suite passes 132 cases.
+The 74-call baseline comparison retains the same two documented differences.
+
+Native validation boundaries
+----------------------------
+
+Numeric values use the same conversion path for indexed and direct devices.
+Non-positive direct channel counts remain rejected before calling PortAudio:
+PortAudio 19.6.0's ALSA direct-device path aborts on channels=0. These regression
+checks run in child processes so a native abort cannot terminate the test suite.
+Embedded NUL characters remain rejected because a C string would silently
+truncate the PCM address. Empty addresses are passed to ALSA.
