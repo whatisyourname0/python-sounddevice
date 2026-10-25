@@ -41,6 +41,17 @@ def test_same_public_calls_across_revisions(number, case, revision_results):
         assert baseline['status'] == 'error'
         assert baseline['type'] == 'TypeError'
         assert candidate == {'status': 'ok'}
+    elif case['operation'] == 'invalid_device_defaults':
+        assert baseline == {
+            'status': 'error', 'type': 'PortAudioError',
+            'args': ['Error querying device 9999'], 'cause': None}
+        message = ('Set samplerate to a number.' if case['missing'] == 'samplerate'
+                   else 'Set channels to an integer.')
+        assert candidate == {
+            'status': 'error', 'type': 'TypeError',
+            'args': ['Cannot query device information. ' + message],
+            'cause': {'type': 'PortAudioError',
+                      'args': ['Error querying device 9999']}}
     elif case.get('invalid') == 'device':
         assert baseline == {'status': 'error', 'type': 'PortAudioError',
                             'args': ['Error querying device 9999']}
@@ -51,6 +62,11 @@ def test_same_public_calls_across_revisions(number, case, revision_results):
         assert candidate == baseline == {
             'status': 'ok', 'callback': {'shape': [1024, 2], 'frames': 1024,
                                         'dtype': 'float32', 'overflow': False}}
+    elif case['operation'] in ('rec', 'playrec'):
+        assert candidate == baseline == {
+            'status': 'ok', 'shape': [1024, 2], 'dtype': 'float32'}
+    elif case['operation'] == 'play':
+        assert candidate == baseline == {'status': 'ok', 'playback': True}
     else:
         assert candidate == baseline
         assert candidate['status'] == (

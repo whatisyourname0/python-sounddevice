@@ -25,15 +25,21 @@ def pytest_configure(config):
     rng = random.Random(0)
     data = bytes(rng.getrandbits(8) for _ in range(192000))
     (root / 'input.raw').write_bytes(data)
+    # Plug exposes a bounded channel range and converts to a stereo null PCM.
+    # Raw null has an excessive maximum; multi over null stalls output callbacks.
     # This standalone configuration has no hardware PCMs or user includes.
     alsa_config = root / 'alsa.conf'
     alsa_config.write_text(
         """
 pcm.null { type null }
 # PortAudio 19.6 expects a deferred default/dmix entry during enumeration.
-pcm.default { type null }
+pcm.default {
+    type plug
+    slave { pcm "null" channels 2 }
+}
 pcm.test_named {
-    type null
+    type plug
+    slave { pcm "null" channels 2 }
     hint { show on description "Synthetic PCM" }
 }
 pcm.portaudio_file_capture {

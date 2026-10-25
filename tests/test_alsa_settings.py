@@ -130,7 +130,7 @@ def test_defaults_and_settings_lifetime(monkeypatch):
     sd.default.reset()
     del settings
     gc.collect()
-    assert ref() is not None
+    assert ref() is None
     with stream:
         assert len(stream.read(1024)[0]) == 4096
     del stream
@@ -171,17 +171,19 @@ def test_legacy_index_and_name():
             assert len(stream.read(1024)[0]) == 4096
 
 
-def test_convenience_mapping_is_explicit_error(monkeypatch):
-    """Convenience mapping is explicit error."""
+@pytest.mark.parametrize('operation', ['play', 'playrec'])
+def test_convenience_mapping_is_explicit_error(operation):
+    """Mono output mapping requires enumerated device information."""
     np = pytest.importorskip('numpy', reason='Convenience API requires NumPy')
+    mapping = {'mapping': [1]} if operation == 'play' else {'output_mapping': [1]}
     with pytest.raises(sd.PortAudioError, match='Error querying device'):
-        sd.play(
+        getattr(sd, operation)(
             np.zeros(128, dtype='float32'),
             48000,
-            mapping=[1],
             device=sd.DEVICE_FROM_EXTRA_SETTINGS,
             extra_settings=sd.AlsaSettings('null'),
             latency=0.05,
+            **mapping,
         )
 
 
@@ -213,12 +215,11 @@ def test_numeric_parameters_have_no_device_specific_validation(key, value):
                              (sd.DEVICE_FROM_EXTRA_SETTINGS, sd.AlsaSettings('null'))]:
         options = dict(channels=2, dtype='int16', latency=0.05, samplerate=48000)
         options[key] = value
-        parameters, _, _, samplerate, owner = sd._get_stream_parameters(
+        parameters, _, _, samplerate = sd._get_stream_parameters(
             'input', device=device, extra_settings=settings, **options)
         actual = dict(channels=parameters.channelCount,
                       samplerate=samplerate, latency=parameters.suggestedLatency)[key]
         results.append(actual)
-        assert owner is settings
     if isinstance(value, float) and math.isnan(value):
         assert all(math.isnan(result) for result in results)
     else:
@@ -265,7 +266,7 @@ def test_mutable_settings_container_lifetime():
     del settings
     gc.collect()
     try:
-        assert ref() is not None
+        assert ref() is None
         with stream:
             assert len(stream.read(1024)[0]) == 4096
     finally:
@@ -293,10 +294,12 @@ def test_device_information_failures_propagate(direction, key, value, monkeypatc
         patch.setattr(sd, 'query_devices', unavailable)
         with pytest.raises(TypeError) as caught:
             cls(**options)
-        required = 'numeric latency' if key == 'latency' else key
-        assert str(caught.value) == (
-            'Cannot determine {} from device information; '
-            'specify {} explicitly or through defaults'.format(key, required))
+        messages = {
+            'channels': 'Set channels to an integer.',
+            'samplerate': 'Set samplerate to a number.',
+            'latency': 'Set latency to a number of seconds.',
+        }
+        assert str(caught.value) == 'Cannot query device information. ' + messages[key]
         assert caught.value.__cause__ is failure
     with cls(**params(device=index, extra_settings=None)) as stream:
         assert stream.device == index
@@ -372,7 +375,7 @@ def test_direct_stream_accepts_settings_protocol(direction, monkeypatch):
 def test_direct_symbolic_latency_fails_and_numeric_recovers(direction, latency):
     """Direct streams cannot derive symbolic latency from unavailable devices."""
     cls = sd.RawInputStream if direction == 'input' else sd.RawOutputStream
-    with pytest.raises(TypeError, match='specify numeric latency') as caught:
+    with pytest.raises(TypeError, match='Set latency to a number of seconds') as caught:
         cls(**params(latency=latency))
     assert isinstance(caught.value.__cause__, sd.PortAudioError)
     assert str(caught.value.__cause__) == 'Error querying device -2'
@@ -388,8 +391,7 @@ def test_missing_parameters_report_first_requirement(direction):
         cls(device=sd.DEVICE_FROM_EXTRA_SETTINGS,
             extra_settings=sd.AlsaSettings('null'))
     assert str(caught.value) == (
-        'Cannot determine channels from device information; '
-        'specify channels explicitly or through defaults')
+        'Cannot query device information. Set channels to an integer.')
     assert isinstance(caught.value.__cause__, sd.PortAudioError)
 
 
@@ -401,8 +403,7 @@ def test_format_check_error_does_not_request_latency(direction):
             device=sd.DEVICE_FROM_EXTRA_SETTINGS,
             extra_settings=sd.AlsaSettings('null'))
     assert str(caught.value) == (
-        'Cannot determine channels from device information; '
-        'specify channels explicitly or through defaults')
+        'Cannot query device information. Set channels to an integer.')
     assert isinstance(caught.value.__cause__, sd.PortAudioError)
 
 
@@ -455,3 +456,46 @@ def test_empty_address_is_forwarded_to_alsa():
     """The backend owns empty-address semantics."""
     settings = sd.AlsaSettings('')
     assert sd._ffi.string(settings._streaminfo.deviceString) == b''
+
+
+@pytest.mark.parametrize('direction', ['input', 'output', 'duplex'])
+@pytest.mark.parametrize('use_defaults', [False, True])
+def test_alsa_settings_can_be_collected_before_start(direction, use_defaults,
+                                                     alsa_capture_bytes):
+    """Capture and playback survive collection of both settings and C buffers."""
+    input_settings = sd.AlsaSettings('portaudio_file_capture')
+    output_settings = sd.AlsaSettings('null')
+    refs = [weakref.ref(input_settings), weakref.ref(output_settings)]
+    pair = [input_settings, output_settings]
+    options = params(extra_settings=pair)
+    if use_defaults:
+        sd.default.extra_settings = pair
+        options['extra_settings'] = None
+    cls = {'input': sd.RawInputStream, 'output': sd.RawOutputStream,
+           'duplex': sd.RawStream}[direction]
+    stream = cls(**options)
+    try:
+        sd.default.reset()
+        options.clear()
+        pair.clear()
+        del input_settings, output_settings
+        gc.collect()
+        assert all(ref() is None for ref in refs)
+        # Reuse allocations after releasing the settings' native buffers.
+        junk = [sd.AlsaSettings('no_such_pcm_after_open') for _ in range(1000)]
+        for iteration in range(2):
+            stream.start()
+            try:
+                if direction != 'input':
+                    stream.write(bytes(4096))
+                if direction != 'output':
+                    data, overflow = stream.read(1024)
+                    assert len(data) == 4096
+                    if iteration == 0:
+                        assert bytes(data) == alsa_capture_bytes[:4096]
+                    assert not overflow
+            finally:
+                stream.stop()
+        assert len(junk) == 1000
+    finally:
+        stream.close()
